@@ -11,6 +11,11 @@ on:
         description: '投稿する番号（空なら予定時刻を過ぎた先頭1件）'
         required: false
         default: ''
+      dry_run:
+        description: '投稿せずに動作確認だけ行う'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -33,20 +38,36 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: 画像URLが実際に取得できるか確認
+        run: |
+          # Instagram APIは公開URLを取りに来る。ここで404なら投稿は必ず失敗する。
+          # リポジトリがPrivateに変更された場合、この時点で気づける。
+          url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/posts/01/01.png"
+          code=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 30 "$url")
+          type=$(curl -sL -o /dev/null -w '%{content_type}' --max-time 30 "$url")
+          echo "status=$code content-type=$type"
+          if [ "$code" != "200" ] || [ "${type#image/}" = "$type" ]; then
+            echo "::error::画像の公開URLを取得できません。リポジトリがPublicか確認してください。"
+            exit 1
+          fi
+
       - name: 投稿
         id: post
         env:
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
         run: |
+          ARGS=""
           if [ -n "${{ inputs.number }}" ]; then
-            python scripts/post_instagram.py --no "${{ inputs.number }}"
-          else
-            python scripts/post_instagram.py
+            ARGS="--no ${{ inputs.number }}"
           fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python scripts/post_instagram.py $ARGS
 
       - name: schedule.json の更新を保存
-        if: success()
+        if: success() && inputs.dry_run != true
         run: |
           if git diff --quiet schedule.json; then
             echo "更新なし（投稿対象がありませんでした）"
@@ -59,7 +80,8 @@ jobs:
           git push
 
       - name: 失敗したらIssueで知らせる
-        if: failure()
+        # 動作確認の失敗でIssueを増やさない
+        if: failure() && inputs.dry_run != true
         uses: actions/github-script@v7
         with:
           script: |
