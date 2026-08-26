@@ -1,0 +1,5 @@
+.env.local
+.env
+new_token.txt
+__pycache__/
+*.pyc

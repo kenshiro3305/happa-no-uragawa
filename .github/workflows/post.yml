@@ -1,0 +1,86 @@
+name: Instagram 投稿
+
+on:
+  schedule:
+    # 月・水・金 08:00 JST（= 日・火・木 23:00 UTC）
+    # GitHub Actionsのcronは混雑時に数十分遅れることがある
+    - cron: '0 23 * * 0,2,4'
+  workflow_dispatch:
+    inputs:
+      number:
+        description: '投稿する番号（空なら予定時刻を過ぎた先頭1件）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: instagram-post
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # 承認者を設定しておくと、ここで停止して承認を待つ
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 投稿
+        id: post
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.number }}" ]; then
+            python scripts/post_instagram.py --no "${{ inputs.number }}"
+          else
+            python scripts/post_instagram.py
+          fi
+
+      - name: schedule.json の更新を保存
+        if: success()
+        run: |
+          if git diff --quiet schedule.json; then
+            echo "更新なし（投稿対象がありませんでした）"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add schedule.json
+          git commit -m "投稿済みを記録 [skip ci]"
+          git push
+
+      - name: 失敗したらIssueで知らせる
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '[要対応] Instagram投稿に失敗しました';
+            const { owner, repo } = context.repo;
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const body = [
+              '葉っぱの裏側の自動投稿が失敗しました。',
+              '',
+              `実行ログ: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              '',
+              '確認項目:',
+              '- IG_ACCESS_TOKEN の有効期限（60日。refresh-token ワークフローが動いているか）',
+              '- リポジトリがPublicのままか（画像URLが取得できなくなります）',
+              '- schedule.json の予定時刻と投稿済みフラグ',
+            ].join('\n');
+            const found = open.data.find((i) => i.title === title);
+            if (found) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: found.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }
