@@ -49,7 +49,17 @@ bash setup.sh                # GitHub Secrets へ登録
 |---|---|---|
 | `IG_USER_ID` | ○ | Instagramのユーザー番号 |
 | `IG_ACCESS_TOKEN` | ○ | アクセストークン |
-| `GH_PAT` | 推奨 | トークン自動延長。**未設定だと60日後に無言で止まる** |
+| `GH_PAT` | ○ | トークン自動延長。**未設定だとワークフローが毎日赤く落ちる**（無言で止まるより、落ちて気づくほうがましなため） |
+| `DIGEST_TO` | ○ | アラートの送信先メールアドレス |
+| `SMTP_USER` | ○ | SMTPユーザー名（Gmailのアドレス） |
+| `SMTP_PASS` | ○ | SMTPパスワード（Gmailのアプリパスワード16桁） |
+| `SMTP_HOST` | 任意 | SMTPサーバ（未設定なら `smtp.gmail.com`） |
+| `SMTP_PORT` | 任意 | SMTPポート（未設定なら `587`） |
+
+アラートはIssueとGmailの両方に出る。Issueは記録として残すためのもので、
+気づくための経路はGmail。**Issueだけにすると、開きっぱなしのまま誰も見ない。**
+送信はSMTP（`smtplib` でSTARTTLS）。`SMTP_PASS` はGmailのアプリパスワードで、
+**このリポジトリ専用のものを発行すること。**
 
 登録後、Settings → Environments → `production` を作り、Required reviewers に自分を追加すると承認制になる。スマホのGitHubアプリに通知が届き、タップで承認できる。
 

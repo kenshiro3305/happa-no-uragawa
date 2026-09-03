@@ -27,17 +27,94 @@ jobs:
         run: |
           echo "has_pat=$HAS_PAT" >> "$GITHUB_OUTPUT"
           if [ "$HAS_PAT" != "true" ]; then
-            echo "::warning::GH_PAT が未設定のため、トークンを自動更新できません。60日後に投稿が止まります。"
+            echo "::error::GH_PAT が未設定のため、トークンを自動更新できません。60日後に投稿が止まります。"
           fi
 
+      - name: GH_PAT 未設定をIssueで知らせる
+        # PATを登録するまで毎日ここを通る。毎日コメントを足すと同じ文面が積み上がって
+        # 読まれなくなるので、同じタイトルのopen Issueが既にあれば何もしない。
+        # 新規作成したときだけ created=true を返し、メールもそのときだけ送る。
+        id: notify
+        if: steps.guard.outputs.has_pat != 'true'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const title = '[要対応] GH_PAT が未設定のためトークンを延長できません';
+            const { owner, repo } = context.repo;
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const body = [
+              'GH_PAT が未設定のため、アクセストークンの自動延長ができていません。',
+              'このワークフローは毎日動いていますが、実際には何もしていません。',
+              '',
+              '**放置すると、最後にトークンを取得した日から60日で投稿が止まります。**',
+              '',
+              `実行ログ: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              '',
+              '対応:',
+              '- Settings → Secrets and variables → Actions に `GH_PAT` を登録する',
+              '- 必要な権限は、このリポジトリの Secrets への書き込み',
+              '- 登録後、Actions からこのワークフローを手動実行して成功を確認する',
+            ].join('\n');
+            const found = open.data.find((i) => i.title === title);
+            if (found) {
+              core.info(`同じ内容のIssue #${found.number} が開いている。重複を増やさないため、何もしない。`);
+              core.setOutput('created', 'false');
+            } else {
+              const made = await github.rest.issues.create({ owner, repo, title, body });
+              core.info(`Issue #${made.data.number} を作成した。`);
+              core.setOutput('created', 'true');
+            }
+
+      - name: GH_PAT 未設定をGmailで知らせる
+        # Issueは記録として残す価値があるので消さない。ただしIssueは開きっぱなしでも
+        # 誰も見に来ないので、気づける場所（Gmail）へも同じ内容を流す。
+        # Secretsが未設定ならこのステップが赤くなる。黙って飛ばして成功にはしない。
+        # 送るのはIssueを新規作成したときだけ。毎日同じ文面が届くと読まれなくなる。
+        if: always() && steps.notify.outputs.created == 'true'
+        env:
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > alert.txt <<EOF
+          GH_PAT が未設定のため、アクセストークンの自動延長ができていません。
+          このワークフローは毎日動いていますが、実際には何もしていません。
+
+          放置すると、最後にトークンを取得した日から60日で投稿が止まります。
+
+          実行ログ: $RUN_URL
+
+          対応:
+          - Settings → Secrets and variables → Actions に GH_PAT を登録する
+          - 必要な権限は、このリポジトリの Secrets への書き込み
+          - 登録後、Actions からこのワークフローを手動実行して成功を確認する
+          EOF
+          python scripts/send_alert_mail.py \
+            --subject "[葉っぱの裏側] GH_PAT が未設定でトークンを延長できません" \
+            --body-file alert.txt
+
+      - name: GH_PAT が未設定ならここで落とす
+        # 何もしていないのに success で終わると、毎日のグリーンが「動いている証拠」に見える。
+        # 設定漏れは隠さず赤で止める。
+        #
+        # always() が要る。状態関数を書かない if には暗黙の success() が付くため、
+        # 前段のメール送信が失敗するとこのステップがskipされ、
+        # 「GH_PATが未設定」ではなく「メールのSecretsが未設定」が失敗理由として表に出てしまう。
+        # 真因をジョブの失敗理由として見せるために、ここは必ず通す。
+        if: always() && steps.guard.outputs.has_pat != 'true'
+        run: exit 1
+
       - name: トークンを延長
-        if: steps.guard.outputs.has_pat == 'true'
         env:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
         run: python scripts/refresh_token.py --out new_token.txt
 
       - name: Secrets に書き戻す
-        if: steps.guard.outputs.has_pat == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         # 標準出力に出さず、ファイルから直接読ませる
@@ -48,7 +125,8 @@ jobs:
         run: rm -f new_token.txt
 
       - name: 失敗したらIssueで知らせる
-        if: failure()
+        # PAT未設定で落ちた場合は専用のIssueが立っているので、ここでは二重に立てない
+        if: failure() && steps.guard.outputs.has_pat == 'true'
         uses: actions/github-script@v9
         with:
           script: |
@@ -72,3 +150,28 @@ jobs:
             } else {
               await github.rest.issues.create({ owner, repo, title, body });
             }
+
+      - name: 失敗をGmailで知らせる
+        # Issueは記録として残す。PAT未設定で落ちた場合は上で専用のメールを送っているので、
+        # ここでは二重に送らない。Secrets未設定ならこのステップが赤くなる。
+        if: failure() && steps.guard.outputs.has_pat == 'true'
+        env:
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > alert.txt <<EOF
+          アクセストークンの自動延長に失敗しました。
+          放置すると60日以内に投稿が止まります。
+
+          実行ログ: $RUN_URL
+
+          すでに失効している場合、延長はできません。
+          Meta for Developers の「API setup with Instagram login」から取り直してください。
+          EOF
+          python scripts/send_alert_mail.py \
+            --subject "[葉っぱの裏側] Instagramトークンの延長に失敗しました" \
+            --body-file alert.txt

@@ -1,0 +1,156 @@
+name: 予定の残数を確認
+
+# 【post.yml に相乗りさせず、別のワークフローにした理由】
+# 1. post.yml は environment: production の承認待ちでジョブが止まる。承認が滞っている
+#    あいだこそ日付だけが進むのに、その期間に残数の通知が届かないのは本末転倒になる。
+# 2. post.yml は月・水・金しか動かない。予定の枯渇は日付とともに近づくので毎日見たい。
+# 3. 投稿が失敗した回は後続ステップがスキップされ、残数の通知も巻き添えで消える。
+#    「投稿できたか」と「あと何本あるか」は別の話なので、切り離しておく。
+# 4. このジョブに必要な権限は issues: write だけで、contents: write を持たせずに済む。
+
+on:
+  schedule:
+    # 毎日 07:00 JST（22:00 UTC）。投稿（08:00 JST）より前に気づけるようにする
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: 未投稿の残数を数える
+        id: count
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os
+          # schedule.json のキーは日本語。未投稿＝「投稿済み」が真でないもの。
+          # 予定時刻が未来かどうかは見ない。過ぎているのに未投稿の分も「まだ出せる在庫」。
+          with open("schedule.json", encoding="utf-8") as f:
+              schedule = json.load(f)
+          entries = schedule.get("予定", [])
+          remaining = [e for e in entries if not e.get("投稿済み")]
+          last = max((e.get("予定時刻", "") for e in entries), default="")
+          lines = [f"- {e.get('番号', '??')} {e.get('タイトル', '')}（{e.get('予定時刻', '')}）"
+                   for e in remaining]
+          listing = "\n".join(lines) or "（残りはありません）"
+
+          # メール本文はここで書き出してしまう。シェルのヒアドキュメントに通すと、
+          # 投稿タイトルに ` や $( が入っていたときにコマンド置換として解釈される。
+          # Pythonの中で組み立てて渡せば、シェルの解釈を経由しない。
+          with open("alert-body.txt", "w", encoding="utf-8") as body:
+              body.write(
+                  f"schedule.json の未投稿は残り {len(remaining)}件 です"
+                  f"（最終予定 {last or 'なし'}）。\n"
+                  "予定が尽きても投稿は失敗しません。エラーを出さずに、静かに止まります。\n"
+                  "\n"
+                  "残っている予定:\n"
+                  f"{listing}\n"
+                  "\n"
+                  f"実行ログ: {os.environ.get('RUN_URL', '')}\n"
+                  "\n"
+                  "足し方:\n"
+                  "- 画像7枚を posts/NN/ に、本文を posts/captions/NN.txt に置く\n"
+                  "- schedule.json の「予定」に行を追加する（投稿済みは false）\n"
+              )
+
+          # 区切り文字は、投稿タイトルに現れない固有の文字列にする。
+          # 単なる EOF だと、本文にその行が含まれたとき出力が壊れる。
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"remaining={len(remaining)}\n")
+              out.write(f"last={last}\n")
+              out.write("list<<SCHEDULE_LIST_EOF\n" + listing + "\nSCHEDULE_LIST_EOF\n")
+          print(f"未投稿 {len(remaining)} 件 / 最終予定 {last or 'なし'}")
+          PY
+
+      - name: 残りが少なくなったらIssueで知らせる
+        # 週3本なので、3件を切るとおよそ1週間で予定が尽きる
+        if: fromJSON(steps.count.outputs.remaining) <= 3
+        uses: actions/github-script@v9
+        env:
+          # タイトルを ${{ }} でスクリプトに直接埋め込むと本文で構文が壊れうるので環境変数で渡す
+          REMAINING: ${{ steps.count.outputs.remaining }}
+          LAST: ${{ steps.count.outputs.last }}
+          LIST: ${{ steps.count.outputs.list }}
+        with:
+          script: |
+            const title = '[要対応] 投稿予定の残りが少なくなりました';
+            const { owner, repo } = context.repo;
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const remaining = process.env.REMAINING;
+            const last = process.env.LAST;
+            const body = [
+              `schedule.json の未投稿は残り **${remaining}件** です（最終予定 ${last || 'なし'}）。`,
+              '予定が尽きても投稿は失敗しません。**エラーを出さずに、静かに止まります。**',
+              '',
+              '残っている予定:',
+              process.env.LIST,
+              '',
+              `実行ログ: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              '',
+              '足し方:',
+              '- 画像7枚を `posts/NN/` に、本文を `posts/captions/NN.txt` に置く',
+              '- `schedule.json` の「予定」に行を追加する（投稿済みは false）',
+            ].join('\n');
+            const found = open.data.find((i) => i.title === title);
+            if (found) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: found.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }
+
+      - name: 残りが少ないことをGmailで知らせる
+        # Issueは記録として残すが、開きっぱなしでも誰も見に来ない。だからGmailへも流す。
+        # このジョブは普段グリーンで終わるぶん、Secrets未設定を黙って飛ばすと
+        # 「毎日成功しているのに何も届かない」になる。未設定ならこのステップを赤くする。
+        #
+        # 本文は「未投稿の残数を数える」ステップがPythonで書き出した alert-body.txt を使う。
+        # ヒアドキュメントを経由させないのは、投稿タイトルのコマンド置換を避けるため。
+        if: fromJSON(steps.count.outputs.remaining) <= 3
+        env:
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          REMAINING: ${{ steps.count.outputs.remaining }}
+        run: |
+          python scripts/send_alert_mail.py \
+            --subject "[葉っぱの裏側] 投稿予定の残りが ${REMAINING}件 になりました" \
+            --body-file alert-body.txt
+
+      - name: 残りが戻ったらIssueを閉じる
+        # 予定を足せば解消する種類の通知なので、解消したら自動で閉じる。
+        # 開いたままにすると、次に枯渇したとき古いIssueへのコメント追記になり、
+        # 通知が過去のやりとりに埋もれて気づけない。閉じておけば次は新規Issueとして届く。
+        if: fromJSON(steps.count.outputs.remaining) > 3
+        uses: actions/github-script@v9
+        env:
+          REMAINING: ${{ steps.count.outputs.remaining }}
+        with:
+          script: |
+            const title = '[要対応] 投稿予定の残りが少なくなりました';
+            const { owner, repo } = context.repo;
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const found = open.data.find((i) => i.title === title);
+            if (!found) return;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: found.number,
+              body: `予定が補充され、未投稿が ${process.env.REMAINING} 件に戻ったので閉じます。`,
+            });
+            await github.rest.issues.update({ owner, repo, issue_number: found.number, state: 'closed' });
