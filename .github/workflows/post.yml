@@ -38,7 +38,24 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: 投稿と通知の設定を確認
+        id: guard
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=(--purpose post)
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python scripts/check_config.py "${args[@]}"
+
       - name: 画像URLが実際に取得できるか確認
+        id: images
         run: |
           # Instagram APIは公開URLを取りに来る。ここで404なら投稿は必ず失敗する。
           # リポジトリがPrivateに変更された場合、この時点で気づける。
@@ -56,17 +73,20 @@ jobs:
         env:
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          POST_NUMBER: ${{ inputs.number }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          ARGS=""
-          if [ -n "${{ inputs.number }}" ]; then
-            ARGS="--no ${{ inputs.number }}"
+          args=()
+          if [ -n "$POST_NUMBER" ]; then
+            args+=(--no "$POST_NUMBER")
           fi
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            ARGS="$ARGS --dry-run"
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
           fi
-          python scripts/post_instagram.py $ARGS
+          python scripts/post_instagram.py "${args[@]}"
 
       - name: schedule.json の更新を保存
+        id: save
         if: success() && inputs.dry_run != true
         run: |
           if git diff --quiet schedule.json; then
@@ -79,10 +99,34 @@ jobs:
           git commit -m "投稿済みを記録 [skip ci]"
           git push
 
+      - name: 失敗原因を実行結果に残す
+        id: diagnosis
+        if: failure()
+        env:
+          CONFIG_REASON: ${{ steps.guard.outputs.reason }}
+          GUARD_RESULT: ${{ steps.guard.outcome }}
+          IMAGE_RESULT: ${{ steps.images.outcome }}
+          SAVE_RESULT: ${{ steps.save.outcome }}
+        run: |
+          if [ "$GUARD_RESULT" = "failure" ]; then
+            reason="${CONFIG_REASON:-設定確認ステップに失敗しました。ログを確認してください。}"
+          elif [ "$IMAGE_RESULT" = "failure" ]; then
+            reason="画像の公開URLを取得できません。公開状態と画像パスを確認してください。"
+          elif [ "$SAVE_RESULT" = "failure" ]; then
+            reason="投稿後の記録保存に失敗しました。再実行前にInstagramの公開履歴を照合してください。"
+          else
+            reason="投稿処理に失敗しました。投稿ステップのエラーを確認してください。"
+          fi
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          printf '\n## 失敗原因\n\n%s\n' "$reason" >> "$GITHUB_STEP_SUMMARY"
+
       - name: 失敗したらIssueで知らせる
         # 動作確認の失敗でIssueを増やさない
         if: failure() && inputs.dry_run != true
         uses: actions/github-script@v9
+        env:
+          FAILURE_REASON: ${{ steps.diagnosis.outputs.reason }}
+          MAIL_MISSING: ${{ steps.guard.outputs.mail_missing }}
         with:
           script: |
             const title = '[要対応] Instagram投稿に失敗しました';
@@ -92,6 +136,8 @@ jobs:
             });
             const body = [
               '葉っぱの裏側の自動投稿が失敗しました。',
+              `原因: ${process.env.FAILURE_REASON || '設定確認前に失敗しました。実行ログを確認してください。'}`,
+              process.env.MAIL_MISSING ? `メール通知も未設定: ${process.env.MAIL_MISSING}` : '',
               '',
               `実行ログ: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
               '',
@@ -99,6 +145,7 @@ jobs:
               '- IG_ACCESS_TOKEN の有効期限（60日。refresh-token ワークフローが動いているか）',
               '- リポジトリがPublicのままか（画像URLが取得できなくなります）',
               '- schedule.json の予定時刻と投稿済みフラグ',
+              '- 公開後の記録保存に失敗した場合は、再実行前に公開履歴を照合する',
             ].join('\n');
             const found = open.data.find((i) => i.title === title);
             if (found) {
@@ -110,8 +157,8 @@ jobs:
       - name: 失敗をGmailで知らせる
         # Issueは記録として残す価値があるので消さない。ただしIssueは開きっぱなしでも
         # 誰も見に来ないので、気づける場所（Gmail）へも同じ内容を流す。
-        # Secretsが未設定ならこのステップが赤くなる。黙って飛ばして成功にはしない。
-        if: failure() && inputs.dry_run != true
+        # 不足はguardの警告・summary・Issueに残す。本来の失敗に通知の二次障害を重ねない。
+        if: failure() && inputs.dry_run != true && steps.guard.outputs.mail_ready == 'true'
         env:
           DIGEST_TO: ${{ secrets.DIGEST_TO }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -119,9 +166,11 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FAILURE_REASON: ${{ steps.diagnosis.outputs.reason }}
         run: |
           cat > alert.txt <<EOF
           葉っぱの裏側の自動投稿が失敗しました。
+          原因: $FAILURE_REASON
 
           実行ログ: $RUN_URL
 
