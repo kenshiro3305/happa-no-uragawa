@@ -15,7 +15,7 @@
   python scripts/post_instagram.py --no 01    # 番号を指定
   python scripts/post_instagram.py --dry-run  # URL組み立てまでで停止
 """
-import json, os, ssl, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, json, os, ssl, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,10 +84,12 @@ def raw_base():
     return f"https://raw.githubusercontent.com/{repo}/{ref}"
 
 
-def pick(schedule, forced):
+def pick(schedule, forced, allow_posted=False):
     if forced:
         for e in schedule["予定"]:
             if e["番号"] == forced:
+                if e["投稿済み"] and not allow_posted:
+                    die(f"番号 {forced} は投稿済みです。再投稿は拒否しました（確認には --dry-run を使用）")
                 return e
         die(f"番号 {forced} が schedule.json にありません")
     now = datetime.now(JST)
@@ -101,19 +103,24 @@ def pick(schedule, forced):
 
 
 def main():
-    argv = sys.argv[1:]
-    dry = "--dry-run" in argv
-    forced = argv[argv.index("--no") + 1] if "--no" in argv else None
+    parser = argparse.ArgumentParser(description="Instagramカルーセル投稿")
+    parser.add_argument("--no", help="schedule.jsonの投稿番号")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    dry, forced = args.dry_run, args.no
+    if forced and (not forced.isascii() or not forced.isdecimal()):
+        die("--no には数字の投稿番号だけを指定してください")
 
     uid = os.environ.get("IG_USER_ID", "").strip()
     token = os.environ.get("IG_ACCESS_TOKEN", "").strip()
     if not dry and (not uid or not token):
-        die("IG_USER_ID または IG_ACCESS_TOKEN が未設定です")
+        missing = [name for name, value in (("IG_USER_ID", uid), ("IG_ACCESS_TOKEN", token)) if not value]
+        die("必須Secretsが未設定: " + ", ".join(missing))
 
     with open(SCHEDULE, encoding="utf-8") as f:
         schedule = json.load(f)
 
-    entry = pick(schedule, forced)
+    entry = pick(schedule, forced, allow_posted=dry)
     if entry is None:
         print("投稿予定はありません。")
         return
